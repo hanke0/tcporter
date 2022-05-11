@@ -12,8 +12,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define MEMORY_BARRIER asm volatile("mfence" ::: "memory")
-
 static void print_usage(const char *name) {
     printf("Usage: %s [PORT] <REMOTE>\n", name);
     printf("Listens to PORT and transfer data between local and REMOTE.\n");
