@@ -22,3 +22,6 @@ lint:
 .PHONY: buildinfo
 buildinfo:
 	@echo target: $(TARGET)
+.PHONY: tar
+tar:
+	tar -cf tcporter.tar.xz `git ls-tree -r HEAD --name-only`
