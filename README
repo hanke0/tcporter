@@ -1,0 +1,25 @@
+TCPORTER
+--------
+
+TCPORTER is TCP stream tool that every like
+iptables NAT port forward. It listens to
+local port and passes data from local and
+remote.
+
+     tcp              tcp
+PC <-----> TCPORTER <-----> RealServer
+
+
+Similar Works
+-------------
+  - rinetd
+
+
+License
+-------
+All software contained within this repo is dual licensed
+GNU General Public License v3.0, see LICENSE for more
+details.
+
+
+ko-han 2022-05-14
