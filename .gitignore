@@ -1,2 +1,4 @@
 /tcporter*
 .vscode
+*.core
+core.*
