@@ -17,8 +17,10 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/io_uring.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,6 +84,16 @@ int __g_tp_log;  // ignore unused variables;
 #define tp_malloc malloc
 #define tp_free free
 
+#define TP_BADFD -1
+#define TP_CBADFD -1
+#define TP_CERR -1
+#define TP_CSUCC 0
+
+#define TP_BUFFER_SIZE 4096
+
+#define TP_CB_ERR -1
+#define TP_CB_SUCC 0
+
 int tp_getnameinfo(const struct sockaddr *addr, socklen_t addrlen, char **host, char **port) {
     static char hostbuf[NI_MAXHOST];
     static char portbuf[NI_MAXSERV];
@@ -109,10 +121,10 @@ int tp_socket_name_info(int fd, char **host, char **port, enum TPSocketType tp) 
             n = getpeername(fd, (struct sockaddr *)(&addr), &addr_len);
             break;
         default:
-            return -1;
+            return TP_CERR;
     }
-    if (n == -1) {
-        return -1;
+    if (n == TP_CERR) {
+        return TP_CERR;
     }
     return tp_getnameinfo((struct sockaddr *)&addr, addr_len, host, port);
 }
@@ -141,7 +153,59 @@ int tp_get_address(const char *host, const char *port, struct addrinfo **addr) {
     return getaddrinfo(host, port, &hints, addr);
 }
 
-#define TP_BUFFER_SIZE 4096
+int tp_listen(uint16_t port) {
+    // socket address used for the server
+    struct sockaddr_in6 server_address;
+    memset(&server_address, 0, sizeof(server_address));
+    server_address.sin6_family = AF_INET6;
+    // htons: host to network short: transforms a value in host byte
+    // ordering format to a short value in network byte ordering format
+    server_address.sin6_port = htons(port);
+    // htonl: host to network long: same as htons but to long
+    server_address.sin6_addr = in6addr_any;
+
+    // create a TCP socket, creation returns -1 on failure
+    int listen_sock;
+    if ((listen_sock = socket(AF_INET6, SOCK_STREAM, 0)) < 0) {
+        TP_LOG(TP_WARNING, "Could not create listen socket: %s\n", TP_ERRMSG);
+        return TP_CBADFD;
+    }
+
+    // bind it to listen to the incoming connections on the created server
+    // address, will return -1 on error
+    if ((bind(listen_sock, (struct sockaddr *)&server_address, sizeof(server_address))) < 0) {
+        TP_LOG(TP_WARNING, "Could not bind socket: %s\n", TP_ERRMSG);
+        return TP_CBADFD;
+    }
+    static const int wait_size = 128;  // maximum number of waiting clients, after which
+                                       // dropping begins
+    if (listen(listen_sock, wait_size) < 0) {
+        TP_LOG(TP_WARNING, "Could not open socket for listening: %s\n", TP_ERRMSG);
+        return TP_CBADFD;
+    }
+    return listen_sock;
+}
+
+int tp_async_connect_to(struct addrinfo *addr) {
+    int sdf = TP_CBADFD;
+    struct addrinfo *rp;
+    for (rp = addr; rp != NULL; rp = rp->ai_next) {
+        sdf = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sdf != TP_CBADFD) {
+            int flags = fcntl(sdf, F_GETFL);
+            if (flags != TP_CERR) {
+                if (fcntl(sdf, F_SETFL, flags | O_NONBLOCK) != TP_CERR) {
+                    int n = connect(sdf, rp->ai_addr, rp->ai_addrlen);
+                    if (n != TP_CERR) break;
+                    if (errno == EINPROGRESS) break;
+                }
+            }
+        }
+        TP_LOG(TP_VERBOSE, "Connect fails: %s\n", TP_ERRMSG);
+        close(sdf);
+    }
+    return sdf;
+}
 
 struct tp_ringbuf {
     int16_t roffset;
@@ -167,133 +231,132 @@ int tp_ringbuf_write_ptr(struct tp_ringbuf *buf, char **start) {
     return filled;
 }
 
-struct tp_chan_data {
+// EPoll Connection.
+struct tp_epc {
     int local;
     int remote;
     struct tp_ringbuf localbuf;
     struct tp_ringbuf remotebuf;
 };
 
-/* A channel  */
-struct tp_chan {
-    unsigned int flags;
-    struct tp_chan_data *data;
+struct tp_epe {
+    unsigned flags;
+    struct tp_epc *conn;
 };
 
-enum TP_CHAN_FLAG {
-    TP_CHAN_LOCAL = 1u,
-    TP_CHAN_REMOTE = 1u << 1,
+enum TP_EPOLL_FLAG {
+    TP_EPOLL_LOCAL = 1u,
+    TP_EPOLL_REMOTE = 1u << 1,
 };
 
-struct tp_chan_list {
-    struct tp_chan chan;
-    struct tp_chan_list *next;
-};
-struct {
-    struct tp_chan_list *list;
-    int len;
-} g_tp_chan_list;
-
-struct tp_chan_data_list {
-    struct tp_chan_data data;
-    struct tp_chan_data_list *next;
+struct tp_epe_list {
+    struct tp_epe entry;
+    struct tp_epe_list *next;
 };
 struct {
-    struct tp_chan_data_list *list;
+    struct tp_epe_list *list;
     int len;
-} g_tp_chan_data_list;
+} g_tp_epe_list;
 
-void _tp_chan_data_init(struct tp_chan_data_list *list) {
-    list->data.local = -1;
-    list->data.remote = -1;
-    list->data.localbuf.roffset = 0;
-    list->data.localbuf.woffset = 0;
-    list->data.remotebuf.roffset = 0;
-    list->data.remotebuf.woffset = 0;
+struct tp_epc_list {
+    struct tp_epc conn;
+    struct tp_epc_list *next;
+};
+struct {
+    struct tp_epc_list *list;
+    int len;
+} g_tp_epc_list;
+
+void _tp_epc_init(struct tp_epc_list *list) {
+    list->conn.local = TP_BADFD;
+    list->conn.remote = TP_BADFD;
+    list->conn.localbuf.roffset = 0;
+    list->conn.localbuf.woffset = 0;
+    list->conn.remotebuf.roffset = 0;
+    list->conn.remotebuf.woffset = 0;
     list->next = NULL;
 }
 
-struct tp_chan_data *tp_new_chan_data() {
-    struct tp_chan_data *c;
-    struct tp_chan_data_list *chanlist;
-    if (g_tp_chan_data_list.len > 0 && g_tp_chan_data_list.list != NULL) {
-        assert(g_tp_chan_data_list.list->next != NULL);
-        c = (struct tp_chan_data *)g_tp_chan_data_list.list->next;
-        g_tp_chan_data_list.list->next = g_tp_chan_data_list.list->next->next;
-        g_tp_chan_data_list.len--;
+struct tp_epc *tp_new_epc() {
+    struct tp_epc *c;
+    struct tp_epc_list *list;
+    if (g_tp_epc_list.len > 0 && g_tp_epc_list.list != NULL) {
+        assert(g_tp_epc_list.list->next != NULL);
+        c = (struct tp_epc *)g_tp_epc_list.list->next;
+        g_tp_epc_list.list->next = g_tp_epc_list.list->next->next;
+        g_tp_epc_list.len--;
         return c;
     }
-    chanlist = (struct tp_chan_data_list *)tp_malloc(sizeof(struct tp_chan_data_list));
-    _tp_chan_data_init(chanlist);
-    return (struct tp_chan_data *)chanlist;
+    list = (struct tp_epc_list *)tp_malloc(sizeof(struct tp_epc_list));
+    _tp_epc_init(list);
+    return (struct tp_epc *)list;
 }
 
-void tp_free_chan_data(struct tp_chan_data *data) {
-    if (g_tp_chan_data_list.list == NULL) {
-        g_tp_chan_data_list.list =
-            (struct tp_chan_data_list *)tp_malloc(sizeof(struct tp_chan_data_list));
-        g_tp_chan_data_list.len = 0;
-        g_tp_chan_data_list.list->next = NULL;
+void tp_free_epc(struct tp_epc *data) {
+    if (g_tp_epc_list.list == NULL) {
+        g_tp_epc_list.list = (struct tp_epc_list *)tp_malloc(sizeof(struct tp_epc_list));
+        g_tp_epc_list.len = 0;
+        g_tp_epc_list.list->next = NULL;
     }
-    struct tp_chan_data_list *mold = g_tp_chan_data_list.list->next;
-    struct tp_chan_data_list *mnew = (struct tp_chan_data_list *)data;
-    if (g_tp_chan_data_list.len > 1024) {
+    struct tp_epc_list *right = g_tp_epc_list.list->next;
+    struct tp_epc_list *left = (struct tp_epc_list *)data;
+    if (g_tp_epc_list.len > 1024) {
+        tp_free(left);
+        return;
+    }
+    left->next = right;
+    g_tp_epc_list.list->next = left;
+    g_tp_epc_list.len++;
+    _tp_epc_init(left);
+}
+
+void tp_epe_init_epc(struct tp_epe *c) {
+    if (c->conn == NULL) {
+        c->conn = tp_new_epc();
+    }
+}
+
+void _tp_epe_list_init(struct tp_epe_list *list) {
+    list->entry.conn = NULL;
+    list->entry.flags = 0;
+    list->next = NULL;
+}
+
+struct tp_epe *tp_new_epe() {
+    struct tp_epe *c;
+    struct tp_epe_list *list;
+    if (g_tp_epe_list.list != NULL && g_tp_epe_list.len > 0) {
+        assert(g_tp_epe_list.list->next != NULL);
+        c = (struct tp_epe *)g_tp_epe_list.list->next;
+        g_tp_epe_list.list->next = g_tp_epe_list.list->next->next;
+        g_tp_epe_list.len--;
+        return c;
+    }
+    list = (struct tp_epe_list *)tp_malloc(sizeof(struct tp_epe_list));
+    _tp_epe_list_init(list);
+    return (struct tp_epe *)list;
+}
+
+void tp_free_epe(struct tp_epe *entry) {
+    if (g_tp_epe_list.list == NULL) {
+        g_tp_epe_list.list = (struct tp_epe_list *)tp_malloc(sizeof(struct tp_epe_list));
+        g_tp_epe_list.len = 0;
+        g_tp_epe_list.list->next = NULL;
+    }
+    struct tp_epe_list *mold = g_tp_epe_list.list->next;
+    struct tp_epe_list *mnew = (struct tp_epe_list *)entry;
+    _tp_epe_list_init(mnew);
+    if (g_tp_epe_list.len > 1024) {
         tp_free(mnew);
         return;
     }
     mnew->next = mold;
-    g_tp_chan_data_list.list->next = mnew;
-    g_tp_chan_data_list.len++;
-    _tp_chan_data_init(mnew);
-}
-
-void tp_chan_init_data(struct tp_chan *c) {
-    if (c->data == NULL) {
-        c->data = tp_new_chan_data();
-    }
-}
-
-void _tp_chan_list_init(struct tp_chan_list *list) {
-    list->chan.data = NULL;
-    list->chan.flags = 0;
-    list->next = NULL;
-}
-
-struct tp_chan *tp_new_chan() {
-    struct tp_chan *c;
-    struct tp_chan_list *list;
-    if (g_tp_chan_list.list != NULL && g_tp_chan_list.len > 0) {
-        assert(g_tp_chan_list.list->next != NULL);
-        c = (struct tp_chan *)g_tp_chan_list.list->next;
-        g_tp_chan_list.list->next = g_tp_chan_list.list->next->next;
-        g_tp_chan_list.len--;
-        return c;
-    }
-    list = (struct tp_chan_list *)tp_malloc(sizeof(struct tp_chan_list));
-    _tp_chan_list_init(list);
-    return (struct tp_chan *)list;
-}
-
-void tp_free_chan(struct tp_chan *chan) {
-    if (g_tp_chan_list.list == NULL) {
-        g_tp_chan_list.list = (struct tp_chan_list *)tp_malloc(sizeof(struct tp_chan_list));
-        g_tp_chan_list.len = 0;
-        g_tp_chan_list.list->next = NULL;
-    }
-    struct tp_chan_list *mold = g_tp_chan_list.list->next;
-    struct tp_chan_list *mnew = (struct tp_chan_list *)chan;
-    _tp_chan_list_init(mnew);
-    if (g_tp_chan_list.len > 1024) {
-        tp_free(mnew);
-        return;
-    }
-    mnew->next = mold;
-    g_tp_chan_list.list->next = mnew;
-    g_tp_chan_list.len++;
+    g_tp_epe_list.list->next = mnew;
+    g_tp_epe_list.len++;
 }
 
 /* Manages all the channels. */
-struct tp_manager {
+struct tp_epoll {
     int pollfd;
     int listenfd;
     int cap;
@@ -303,209 +366,149 @@ struct tp_manager {
     int maxevents;
 };
 
-struct tp_events {
+// EPoll EVentS.
+struct tp_epevs {
     struct epoll_event *events;
     int size;
 };
 
-void tp_free_manager(struct tp_manager *mgr) {
-    if (mgr->listenfd > 0) {
-        close(mgr->listenfd);
+void tp_free_epoll(struct tp_epoll *poll) {
+    if (poll->listenfd > 0) {
+        close(poll->listenfd);
     }
-    if (mgr->pollfd > 0) {
-        close(mgr->pollfd);
+    if (poll->pollfd > 0) {
+        close(poll->pollfd);
     }
-    free(mgr->events);
-    free(mgr);
+    free(poll->events);
+    free(poll);
 }
 
-struct tp_manager *tp_new_manager(int cap, int listenfd) {
-    struct tp_manager *mgr = (struct tp_manager *)tp_malloc(sizeof(struct tp_manager));
-    memset(mgr, 0, sizeof(struct tp_manager));
+struct tp_epoll *tp_create_epoll(int cap, int listenfd) {
+    struct tp_epoll *poll = (struct tp_epoll *)tp_malloc(sizeof(struct tp_epoll));
+    memset(poll, 0, sizeof(struct tp_epoll));
     int maxevents = cap * 2 + 1;
-    mgr->events = (struct epoll_event *)tp_malloc(sizeof(struct epoll_event) * maxevents);
+    poll->events = (struct epoll_event *)tp_malloc(sizeof(struct epoll_event) * maxevents);
     int pollfd = epoll_create(maxevents);
-    if (pollfd == -1) {
+    if (pollfd == TP_CBADFD) {
         TP_LOG(TP_VERBOSE, "Create epoll fails: %s\n", TP_ERRMSG);
-        tp_free_manager(mgr);
+        tp_free_epoll(poll);
         return NULL;
     }
-    struct tp_chan *chan = tp_new_chan();
-    tp_chan_init_data(chan);
-    chan->data->local = listenfd;
-    chan->flags = TP_CHAN_LOCAL;
+    struct tp_epe *chan = tp_new_epe();
+    tp_epe_init_epc(chan);
+    chan->conn->local = listenfd;
+    chan->flags = TP_EPOLL_LOCAL;
     struct epoll_event ev;
     ev.data.ptr = chan;
     ev.events = EPOLLIN;
     if (epoll_ctl(pollfd, EPOLL_CTL_ADD, listenfd, &ev) != 0) {
         TP_LOG(TP_VERBOSE, "poll register listener fails: %s\n", TP_ERRMSG);
         close(pollfd);
-        tp_free_manager(mgr);
+        tp_free_epoll(poll);
         return NULL;
     }
 
-    mgr->cap = cap;
-    mgr->len = 0;
-    mgr->listenfd = listenfd;
-    mgr->pollfd = pollfd;
-    mgr->maxevents = maxevents;
-    return mgr;
+    poll->cap = cap;
+    poll->len = 0;
+    poll->listenfd = listenfd;
+    poll->pollfd = pollfd;
+    poll->maxevents = maxevents;
+    return poll;
 }
 
-void tp_close_manager(struct tp_manager *mgr) {
-    if (mgr->pollfd >= 0) {
-        close(mgr->pollfd);
+void tp_close_epoll(struct tp_epoll *poll) {
+    if (poll->pollfd >= 0) {
+        close(poll->pollfd);
     }
-    tp_free_manager(mgr);
+    tp_free_epoll(poll);
 }
 
-int tp_register_chan(struct tp_manager *mgr, int local, int remote) {
-    if (mgr->len == mgr->cap) {
+int tp_epoll_register_conn(struct tp_epoll *poll, int local, int remote) {
+    if (poll->len == poll->cap) {
         TP_LOG(TP_WARNING, "Pool full, close %d,%d\n", local, remote);
-        return -1;
+        return TP_CERR;
     }
     struct epoll_event ev;
-    struct tp_chan *c0, *c1;
-    c0 = tp_new_chan();
-    tp_chan_init_data(c0);
-    c0->data->local = local;
-    c0->data->remote = remote;
-    c0->flags = TP_CHAN_LOCAL;
+    struct tp_epe *c0, *c1;
+    c0 = tp_new_epe();
+    tp_epe_init_epc(c0);
+    c0->conn->local = local;
+    c0->conn->remote = remote;
+    c0->flags = TP_EPOLL_LOCAL;
 
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.ptr = c0;
-    if (epoll_ctl(mgr->pollfd, EPOLL_CTL_ADD, local, &ev) != 0) {
-        return -1;
+    if (epoll_ctl(poll->pollfd, EPOLL_CTL_ADD, local, &ev) != 0) {
+        return TP_CERR;
     }
-    c1 = tp_new_chan();
-    c1->flags = TP_CHAN_REMOTE;
-    c1->data = c0->data;
+    c1 = tp_new_epe();
+    c1->flags = TP_EPOLL_REMOTE;
+    c1->conn = c0->conn;
     ev.data.ptr = c1;
-    if (epoll_ctl(mgr->pollfd, EPOLL_CTL_ADD, remote, &ev) != 0) {
-        epoll_ctl(mgr->pollfd, EPOLL_CTL_DEL, local, &ev);
-        return -1;
+    if (epoll_ctl(poll->pollfd, EPOLL_CTL_ADD, remote, &ev) != 0) {
+        epoll_ctl(poll->pollfd, EPOLL_CTL_DEL, local, &ev);
+        return TP_CERR;
     }
-    mgr->len++;
-    assert(mgr->len <= mgr->cap);
+    poll->len++;
+    assert(poll->len <= poll->cap);
     return 0;
 }
 
 #define TP_SETPTR(x, y) \
     if (x != NULL) *x = y
 
-void _tp_get_handle_data(struct tp_chan *chan, int *fdptr, int *ofdptr, struct tp_ringbuf **rbufptr,
-                         struct tp_ringbuf **wbufptr, int **closefd) {
-    if (chan->flags & TP_CHAN_LOCAL) {
-        TP_SETPTR(fdptr, chan->data->local);
-        TP_SETPTR(ofdptr, chan->data->remote);
-        TP_SETPTR(rbufptr, &chan->data->localbuf);
-        TP_SETPTR(wbufptr, &chan->data->remotebuf);
-        TP_SETPTR(closefd, &chan->data->local);
-    } else if (chan->flags & TP_CHAN_REMOTE) {
-        TP_SETPTR(fdptr, chan->data->remote);
-        TP_SETPTR(ofdptr, chan->data->local);
-        TP_SETPTR(rbufptr, &chan->data->remotebuf);
-        TP_SETPTR(wbufptr, &chan->data->localbuf);
-        TP_SETPTR(closefd, &chan->data->remote);
+void _tp_epoll_conn_extract(struct tp_epe *entry, int *fdptr, int *ofdptr,
+                            struct tp_ringbuf **rbufptr, struct tp_ringbuf **wbufptr,
+                            int **closefd) {
+    if (entry->flags & TP_EPOLL_LOCAL) {
+        TP_SETPTR(fdptr, entry->conn->local);
+        TP_SETPTR(ofdptr, entry->conn->remote);
+        TP_SETPTR(rbufptr, &entry->conn->localbuf);
+        TP_SETPTR(wbufptr, &entry->conn->remotebuf);
+        TP_SETPTR(closefd, &entry->conn->local);
+    } else if (entry->flags & TP_EPOLL_REMOTE) {
+        TP_SETPTR(fdptr, entry->conn->remote);
+        TP_SETPTR(ofdptr, entry->conn->local);
+        TP_SETPTR(rbufptr, &entry->conn->remotebuf);
+        TP_SETPTR(wbufptr, &entry->conn->localbuf);
+        TP_SETPTR(closefd, &entry->conn->remote);
     } else {
-        TP_PANIC("Bad channel flags: %d\n", chan->flags);
+        TP_PANIC("Bad channel flags: %d\n", entry->flags);
     }
 }
 
-int tp_close_chan(struct tp_manager *mgr, struct tp_chan *chan) {
+int tp_epoll_close_conn(struct tp_epoll *poll, struct tp_epe *entry) {
     int fd, ofd, *closefd;
-    _tp_get_handle_data(chan, &fd, &ofd, NULL, NULL, &closefd);
-    struct tp_chan_data *data = chan->data;
-    tp_free_chan(chan);
-    if (ofd == -1) {
-        tp_free_chan_data(data);
-        mgr->len--;
-        TP_LOG(TP_INFO, "Client closed. %d clients connected\n", mgr->len);
+    _tp_epoll_conn_extract(entry, &fd, &ofd, NULL, NULL, &closefd);
+    struct tp_epc *data = entry->conn;
+    tp_free_epe(entry);
+    if (ofd == TP_BADFD) {
+        tp_free_epc(data);
+        poll->len--;
+        TP_LOG(TP_INFO, "Client closed. %d clients connected\n", poll->len);
     }
     TP_LOG(TP_VERBOSE, "Close fd: %d\n", fd);
     struct epoll_event ev;  // events is ignored when EPOLL_CTL_DEL;
-    int n = epoll_ctl(mgr->pollfd, EPOLL_CTL_DEL, fd, &ev);
+    int n = epoll_ctl(poll->pollfd, EPOLL_CTL_DEL, fd, &ev);
     close(fd);
-    *closefd = -1;
+    *closefd = TP_BADFD;
     return n;
 }
 
-struct tp_events tp_wait_events(struct tp_manager *mgr) {
+struct tp_epevs tp_epoll_wait(struct tp_epoll *poll) {
     static const int timeout = 10;  // 10ms
-    int size = epoll_wait(mgr->pollfd, mgr->events, mgr->maxevents, timeout);
-    struct tp_events events;
-    events.events = mgr->events;
+    int size = epoll_wait(poll->pollfd, poll->events, poll->maxevents, timeout);
+    struct tp_epevs events;
+    events.events = poll->events;
     events.size = size;
     return events;
 }
 
-int tp_async_connect_to(struct addrinfo *addr) {
-    int sdf = -1;
-    struct addrinfo *rp;
-    for (rp = addr; rp != NULL; rp = rp->ai_next) {
-        sdf = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sdf != -1) {
-            int flags = fcntl(sdf, F_GETFL);
-            if (flags != -1) {
-                if (fcntl(sdf, F_SETFL, flags | O_NONBLOCK) != -1) {
-                    int n = connect(sdf, rp->ai_addr, rp->ai_addrlen);
-                    if (n != -1) break;
-                    if (errno == EINPROGRESS) break;
-                }
-            }
-        }
-        TP_LOG(TP_VERBOSE, "Connect fails: %s\n", TP_ERRMSG);
-        close(sdf);
-    }
-    if (sdf != -1) {
-        char *host, *port;
-        if (tp_getnameinfo(rp->ai_addr, rp->ai_addrlen, &host, &port) != 0) {
-            close(sdf);
-            return -1;
-        }
-        TP_LOG(TP_VERBOSE, "Connect to: %s:%s\n", host, port);
-    }
-    return sdf;
-}
-
-int tp_listen(uint16_t port) {
-    // socket address used for the server
-    struct sockaddr_in6 server_address;
-    memset(&server_address, 0, sizeof(server_address));
-    server_address.sin6_family = AF_INET6;
-    // htons: host to network short: transforms a value in host byte
-    // ordering format to a short value in network byte ordering format
-    server_address.sin6_port = htons(port);
-    // htonl: host to network long: same as htons but to long
-    server_address.sin6_addr = in6addr_any;
-
-    // create a TCP socket, creation returns -1 on failure
-    int listen_sock;
-    if ((listen_sock = socket(AF_INET6, SOCK_STREAM, 0)) < 0) {
-        TP_LOG(TP_WARNING, "Could not create listen socket: %s\n", TP_ERRMSG);
-        return -1;
-    }
-
-    // bind it to listen to the incoming connections on the created server
-    // address, will return -1 on error
-    if ((bind(listen_sock, (struct sockaddr *)&server_address, sizeof(server_address))) < 0) {
-        TP_LOG(TP_WARNING, "Could not bind socket: %s\n", TP_ERRMSG);
-        return -1;
-    }
-    static const int wait_size = 128;  // maximum number of waiting clients, after which
-                                       // dropping begins
-    if (listen(listen_sock, wait_size) < 0) {
-        TP_LOG(TP_WARNING, "Could not open socket for listening: %s\n", TP_ERRMSG);
-        return -1;
-    }
-    return listen_sock;
-}
-
-int _tp_handle_chan_accept(struct tp_manager *mgr) {
-    TP_LOG(TP_VERBOSE, "Handle accepting: %d\n", mgr->listenfd);
+int _tp_epoll_accept_callback(struct tp_epoll *poll) {
+    TP_LOG(TP_VERBOSE, "Handle accepting: %d\n", poll->listenfd);
     struct sockaddr_in client_address;
     socklen_t client_address_len = sizeof(struct sockaddr_in);
-    int fd = accept(mgr->listenfd, &client_address, &client_address_len);
+    int fd = accept(poll->listenfd, &client_address, &client_address_len);
     char *host, *port;
     int n = tp_socket_name_info(fd, &host, &port, TPSocketTypePeer);
     if (n != 0) {
@@ -513,13 +516,13 @@ int _tp_handle_chan_accept(struct tp_manager *mgr) {
         close(fd);
         return 0;
     }
-    int rfd = tp_async_connect_to(mgr->forward_addr_list);
-    if (rfd == -1) {
+    int rfd = tp_async_connect_to(poll->forward_addr_list);
+    if (rfd == TP_CBADFD) {
         close(fd);
         TP_LOG(TP_WARNING, "Could not connect to remote: %s\n", TP_ERRMSG);
         return 0;
     }
-    if (tp_register_chan(mgr, fd, rfd) != 0) {
+    if (tp_epoll_register_conn(poll, fd, rfd) != 0) {
         TP_LOG(TP_WARNING, "Could not join to the queue: epoll: %s\n", TP_ERRMSG);
         close(fd);
         close(rfd);
@@ -527,16 +530,16 @@ int _tp_handle_chan_accept(struct tp_manager *mgr) {
     }
 
     TP_LOG(TP_INFO, "Client established: %d,%d %s:%s. %d clients connected\n", fd, rfd, host, port,
-           mgr->len);
+           poll->len);
     return 0;
 }
 
-int _tp_handle_chan_read(struct tp_manager *mgr, struct tp_chan *chan) {
+int _tp_epoll_read_callback(struct tp_epoll *mgr, struct tp_epe *entry) {
     int fd, ofd;
     struct tp_ringbuf *buf;
-    _tp_get_handle_data(chan, &fd, &ofd, &buf, NULL, NULL);
+    _tp_epoll_conn_extract(entry, &fd, &ofd, &buf, NULL, NULL);
 
-    if (ofd == -1) {
+    if (ofd == TP_BADFD) {
         TP_LOG(TP_VERBOSE, "Other side closed, read stopping. %d\n", fd);
         return 0;
     }
@@ -549,30 +552,30 @@ int _tp_handle_chan_read(struct tp_manager *mgr, struct tp_chan *chan) {
     }
     size = recv(fd, start, maxsize, MSG_DONTWAIT);
     if (size == 0) {
-        return -1;
+        return TP_CB_ERR;
     }
     if (size < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return 0;
         }
         TP_LOG(TP_VERBOSE, "Recv fails: %d, %s\n", fd, TP_ERRMSG);
-        return -1;
+        return TP_CB_ERR;
     }
     buf->roffset += size;
     return 0;
 }
 
-int _tp_handle_chan_write(struct tp_manager *mgr, struct tp_chan *chan) {
+int _tp_epoll_write_callback(struct tp_epoll *poll, struct tp_epe *entry) {
     int fd, ofd;
     struct tp_ringbuf *buf;
-    _tp_get_handle_data(chan, &fd, &ofd, NULL, &buf, NULL);
+    _tp_epoll_conn_extract(entry, &fd, &ofd, NULL, &buf, NULL);
 
     int size, maxsize;
     char *start = NULL;
     maxsize = tp_ringbuf_write_ptr(buf, &start);
     if (maxsize == 0) {
-        if (ofd == -1) {
-            return -1;
+        if (ofd == TP_BADFD) {  // Other side closed, stopping write.
+            return TP_CB_ERR;
         }
         return 0;
     }
@@ -582,53 +585,53 @@ int _tp_handle_chan_write(struct tp_manager *mgr, struct tp_chan *chan) {
             return 0;
         }
         TP_LOG(TP_WARNING, "Send fails: %s", TP_ERRMSG);
-        return -1;
+        return TP_CB_ERR;
     }
     buf->woffset += size;
     return 0;
 }
 
-int tp_handle_chan(struct tp_manager *mgr, struct tp_chan *chan, uint32_t mask) {
+int tp_epoll_callback(struct tp_epoll *poll, struct tp_epe *entry, uint32_t mask) {
     int fd;
-    _tp_get_handle_data(chan, &fd, NULL, NULL, NULL, NULL);
-    if (fd == -1) {  // already closed
-        return 0;
+    _tp_epoll_conn_extract(entry, &fd, NULL, NULL, NULL, NULL);
+    if (fd == TP_BADFD) {  // already closed
+        return TP_CB_SUCC;
     }
-    if (fd == mgr->listenfd) {
-        return _tp_handle_chan_accept(mgr);
+    if (fd == poll->listenfd) {
+        return _tp_epoll_accept_callback(poll);
     }
 
     if (mask & EPOLLHUP) {
-        return -1;
+        return TP_CB_ERR;
     }
 
     if (mask & EPOLLERR) {
-        return -1;
+        return TP_CB_ERR;
     }
 
     if (mask & EPOLLIN) {  // readable
-        int n = _tp_handle_chan_read(mgr, chan);
+        int n = _tp_epoll_read_callback(poll, entry);
         if (n != 0) {
-            return -1;
+            return TP_CB_ERR;
         }
     }
 
     if (mask & EPOLLOUT) {
-        int n = _tp_handle_chan_write(mgr, chan);
+        int n = _tp_epoll_write_callback(poll, entry);
         if (n != 0) {
-            return -1;
+            return TP_CB_ERR;
         }
     }
-    return 0;
+    return TP_CB_SUCC;
 }
 
 int tp_epoll_main(struct tp_args args) {
     int listenfd = tp_listen(args.port);
-    if (listenfd == -1) {
+    if (listenfd == TP_BADFD) {
         TP_PANIC("Listen port fails: %s\n", TP_ERRMSG);
         return 1;
     }
-    struct tp_manager *mgr = tp_new_manager(1024, listenfd);
+    struct tp_epoll *mgr = tp_create_epoll(1024, listenfd);
     if (mgr == NULL) {
         TP_PANIC("Could not setup manager: %s\n", TP_ERRMSG);
         return 1;
@@ -637,14 +640,14 @@ int tp_epoll_main(struct tp_args args) {
     int n;
     if ((n = tp_socket_name_info(mgr->listenfd, &host, &port, TPSocketTypeLocal)) != 0) {
         TP_LOG(TP_WARNING, "Could not get listen address: %s, %s\n", gai_strerror(n), TP_ERRMSG);
-        tp_free_manager(mgr);
+        tp_free_epoll(mgr);
         return 1;
     }
     mgr->forward_addr_list = args.forward_addr_list;
     TP_LOG(TP_INFO, "Listen at %s:%s\n", host, port);
-    struct tp_events events;
+    struct tp_epevs events;
     for (;;) {
-        events = tp_wait_events(mgr);
+        events = tp_epoll_wait(mgr);
         if (events.size < 0) {
             TP_LOG(TP_WARNING, "Pool wait fails: %s\n", TP_ERRMSG);
             return 1;
@@ -655,11 +658,11 @@ int tp_epoll_main(struct tp_args args) {
         int i;
         for (i = 0; i < events.size; i++) {
             int ret;
-            struct tp_chan *chan = (struct tp_chan *)(events.events[i].data.ptr);
-            ret = tp_handle_chan(mgr, chan, events.events[i].events);
-            if (ret != 0) {
-                ret = tp_close_chan(mgr, chan);
-                if (ret != 0) {
+            struct tp_epe *chan = (struct tp_epe *)(events.events[i].data.ptr);
+            ret = tp_epoll_callback(mgr, chan, events.events[i].events);
+            if (ret != TP_CB_SUCC) {
+                ret = tp_epoll_close_conn(mgr, chan);
+                if (ret != TP_CSUCC) {
                     TP_LOG(TP_WARNING, "Close channel fails: %s\n", TP_ERRMSG);
                     return 1;
                 }
@@ -728,12 +731,12 @@ void tp_start_transfer(int sock, int remote) {
 }
 
 int tp_connect_to(struct addrinfo *addr) {
-    int sdf = -1;
+    int sdf = TP_CBADFD;
     struct addrinfo *rp;
     for (rp = addr; rp != NULL; rp = rp->ai_next) {
         sdf = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sdf == -1) continue;
-        if ((connect(sdf, rp->ai_addr, rp->ai_addrlen)) != -1) {
+        if (sdf == TP_CBADFD) continue;
+        if ((connect(sdf, rp->ai_addr, rp->ai_addrlen)) != TP_CERR) {
             break;
         }
         close(sdf);
@@ -743,13 +746,13 @@ int tp_connect_to(struct addrinfo *addr) {
 
 int tp_thread_main(struct tp_args args) {
     int listenfd;
-    if ((listenfd = tp_listen(args.port)) == -1) {
+    if ((listenfd = tp_listen(args.port)) == TP_CERR) {
         TP_LOG(TP_WARNING, "Could not listen: %s\n", TP_ERRMSG);
         return 1;
     }
     char *host, *port;
     int n = tp_socket_name_info(listenfd, &host, &port, TPSocketTypeLocal);
-    if (n == -1) {
+    if (n == TP_CERR) {
         TP_LOG(TP_WARNING, "Could not get listened host and port: %s\n", TP_ERRMSG);
         close(listenfd);
         return 1;
@@ -768,7 +771,7 @@ int tp_thread_main(struct tp_args args) {
             return 1;
         }
         n = tp_socket_name_info(sock, &host, &port, TPSocketTypePeer);
-        if (n == -1) {
+        if (n == TP_CERR) {
             TP_LOG(TP_WARNING, "Could not get host and port %s\n", TP_ERRMSG);
             close(sock);
             continue;
@@ -776,7 +779,7 @@ int tp_thread_main(struct tp_args args) {
         TP_LOG(TP_INFO, "Client connected: %s:%s\n", host, port);
 
         remote = tp_connect_to(args.forward_addr_list);
-        if (remote == -1) {
+        if (remote == TP_CERR) {
             TP_LOG(TP_WARNING, "Could not connect remote: %s\n", TP_ERRMSG);
             close(sock);
             continue;
