@@ -239,6 +239,7 @@ struct tp_epc {
     struct tp_ringbuf remotebuf;
 };
 
+// EPoll Entry.
 struct tp_epe {
     unsigned flags;
     struct tp_epc *conn;
@@ -292,14 +293,14 @@ struct tp_epc *tp_new_epc() {
     return (struct tp_epc *)list;
 }
 
-void tp_free_epc(struct tp_epc *data) {
+void tp_free_epc(struct tp_epc *conn) {
     if (g_tp_epc_list.list == NULL) {
         g_tp_epc_list.list = (struct tp_epc_list *)tp_malloc(sizeof(struct tp_epc_list));
         g_tp_epc_list.len = 0;
         g_tp_epc_list.list->next = NULL;
     }
     struct tp_epc_list *right = g_tp_epc_list.list->next;
-    struct tp_epc_list *left = (struct tp_epc_list *)data;
+    struct tp_epc_list *left = (struct tp_epc_list *)conn;
     if (g_tp_epc_list.len > 1024) {
         tp_free(left);
         return;
@@ -355,7 +356,7 @@ void tp_free_epe(struct tp_epe *entry) {
     g_tp_epe_list.len++;
 }
 
-/* Manages all the channels. */
+/* Manages all the epoll entries. */
 struct tp_epoll {
     int pollfd;
     int listenfd;
@@ -394,12 +395,12 @@ struct tp_epoll *tp_create_epoll(int cap, int listenfd) {
         tp_free_epoll(poll);
         return NULL;
     }
-    struct tp_epe *chan = tp_new_epe();
-    tp_epe_init_epc(chan);
-    chan->conn->local = listenfd;
-    chan->flags = TP_EPOLL_LOCAL;
+    struct tp_epe *entry = tp_new_epe();
+    tp_epe_init_epc(entry);
+    entry->conn->local = listenfd;
+    entry->flags = TP_EPOLL_LOCAL;
     struct epoll_event ev;
-    ev.data.ptr = chan;
+    ev.data.ptr = entry;
     ev.events = EPOLLIN;
     if (epoll_ctl(pollfd, EPOLL_CTL_ADD, listenfd, &ev) != 0) {
         TP_LOG(TP_VERBOSE, "poll register listener fails: %s\n", TP_ERRMSG);
@@ -473,17 +474,17 @@ void _tp_epoll_conn_extract(struct tp_epe *entry, int *fdptr, int *ofdptr,
         TP_SETPTR(wbufptr, &entry->conn->localbuf);
         TP_SETPTR(closefd, &entry->conn->remote);
     } else {
-        TP_PANIC("Bad channel flags: %d\n", entry->flags);
+        TP_PANIC("Bad epoll entry flags: %d\n", entry->flags);
     }
 }
 
 int tp_epoll_close_conn(struct tp_epoll *poll, struct tp_epe *entry) {
     int fd, ofd, *closefd;
     _tp_epoll_conn_extract(entry, &fd, &ofd, NULL, NULL, &closefd);
-    struct tp_epc *data = entry->conn;
+    struct tp_epc *conn = entry->conn;
     tp_free_epe(entry);
     if (ofd == TP_BADFD) {
-        tp_free_epc(data);
+        tp_free_epc(conn);
         poll->len--;
         TP_LOG(TP_INFO, "Client closed. %d clients connected\n", poll->len);
     }
@@ -534,7 +535,7 @@ int _tp_epoll_accept_callback(struct tp_epoll *poll) {
     return 0;
 }
 
-int _tp_epoll_read_callback(struct tp_epoll *mgr, struct tp_epe *entry) {
+int _tp_epoll_read_callback(struct tp_epoll *poll, struct tp_epe *entry) {
     int fd, ofd;
     struct tp_ringbuf *buf;
     _tp_epoll_conn_extract(entry, &fd, &ofd, &buf, NULL, NULL);
@@ -631,23 +632,23 @@ int tp_epoll_main(struct tp_args args) {
         TP_PANIC("Listen port fails: %s\n", TP_ERRMSG);
         return 1;
     }
-    struct tp_epoll *mgr = tp_create_epoll(1024, listenfd);
-    if (mgr == NULL) {
+    struct tp_epoll *poll = tp_create_epoll(1024, listenfd);
+    if (poll == NULL) {
         TP_PANIC("Could not setup manager: %s\n", TP_ERRMSG);
         return 1;
     }
     char *host, *port;
     int n;
-    if ((n = tp_socket_name_info(mgr->listenfd, &host, &port, TPSocketTypeLocal)) != 0) {
+    if ((n = tp_socket_name_info(poll->listenfd, &host, &port, TPSocketTypeLocal)) != 0) {
         TP_LOG(TP_WARNING, "Could not get listen address: %s, %s\n", gai_strerror(n), TP_ERRMSG);
-        tp_free_epoll(mgr);
+        tp_free_epoll(poll);
         return 1;
     }
-    mgr->forward_addr_list = args.forward_addr_list;
+    poll->forward_addr_list = args.forward_addr_list;
     TP_LOG(TP_INFO, "Listen at %s:%s\n", host, port);
     struct tp_epevs events;
     for (;;) {
-        events = tp_epoll_wait(mgr);
+        events = tp_epoll_wait(poll);
         if (events.size < 0) {
             TP_LOG(TP_WARNING, "Pool wait fails: %s\n", TP_ERRMSG);
             return 1;
@@ -658,12 +659,12 @@ int tp_epoll_main(struct tp_args args) {
         int i;
         for (i = 0; i < events.size; i++) {
             int ret;
-            struct tp_epe *chan = (struct tp_epe *)(events.events[i].data.ptr);
-            ret = tp_epoll_callback(mgr, chan, events.events[i].events);
+            struct tp_epe *entry = (struct tp_epe *)(events.events[i].data.ptr);
+            ret = tp_epoll_callback(poll, entry, events.events[i].events);
             if (ret != TP_CB_SUCC) {
-                ret = tp_epoll_close_conn(mgr, chan);
+                ret = tp_epoll_close_conn(poll, entry);
                 if (ret != TP_CSUCC) {
-                    TP_LOG(TP_WARNING, "Close channel fails: %s\n", TP_ERRMSG);
+                    TP_LOG(TP_WARNING, "Close connection fails: %s\n", TP_ERRMSG);
                     return 1;
                 }
             }
