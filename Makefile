@@ -1,4 +1,4 @@
-CFLAGS := -Wall -pedantic -pthread -m64 -std=c11
+CFLAGS := -Wall -pedantic -pthread -m64 -std=c11 -Wno-pointer-arith
 PROGRAM := tcporter
 TARGET := $(shell sh -c 'uname -s 2>/dev/null || echo not')
 ifeq ($(TARGET), Linux)

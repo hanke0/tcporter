@@ -26,7 +26,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -93,6 +95,9 @@ int __g_tp_log;  // ignore unused variables;
 
 #define TP_CB_ERR -1
 #define TP_CB_SUCC 0
+
+#define TP_SETPTR(x, y) \
+    if (x != NULL) *x = y
 
 int tp_getnameinfo(const struct sockaddr *addr, socklen_t addrlen, char **host, char **port) {
     static char hostbuf[NI_MAXHOST];
@@ -206,6 +211,230 @@ int tp_async_connect_to(struct addrinfo *addr) {
     }
     return sdf;
 }
+
+/***** io_uring implementation *****/
+
+/* Macros for barriers needed by io_uring */
+#define io_uring_smp_store_release(p, v) atomic_store_explicit(p, (v), memory_order_release)
+#define io_uring_smp_load_acquire(p) atomic_load_explicit(p, memory_order_acquire)
+#define IO_URING_WRITE_ONCE(var, val) atomic_store_explicit(var, (val), memory_order_relaxed)
+#define IO_URING_READ_ONCE(var) atomic_load_explicit(var, memory_order_relaxed)
+#define io_uring_smp_mb() atomic_thread_fence(memory_order_seq_cst)
+
+/*
+ * System call wrappers provided since glibc does not yet
+ * provide wrappers for io_uring system calls.
+ * */
+inline int io_uring_setup(unsigned entries, struct io_uring_params *p) {
+    return (int)syscall(__NR_io_uring_setup, entries, p);
+}
+inline int io_uring_enter(int ring_fd, unsigned int to_submit, unsigned int min_complete,
+                          unsigned int flags) {
+    return (int)syscall(__NR_io_uring_enter, ring_fd, to_submit, min_complete, flags, NULL, 0);
+}
+
+inline int io_uring_register(int fd, unsigned opcode, const void *arg, unsigned nr_args) {
+    return (int)syscall(__NR_io_uring_register, fd, opcode, arg, nr_args);
+}
+
+/*
+ * io_uring interfaces.
+ */
+
+/* Submition Queue. */
+struct tp_uring_sq {
+    _Atomic unsigned *khead;
+    _Atomic unsigned *ktail;
+    _Atomic unsigned *kring_mask;
+    _Atomic unsigned *kring_entries;
+    _Atomic unsigned *kflags;
+    _Atomic unsigned *kdropped;
+    unsigned *array;
+
+    struct io_uring_sqe *sqes;
+    unsigned sqe_head;
+    unsigned sqe_tail;
+
+    size_t ring_sz;
+    void *ring_ptr;
+};
+
+/* Complation Queue. */
+struct tp_uring_cq {
+    _Atomic unsigned *khead;
+    _Atomic unsigned *ktail;
+    _Atomic unsigned *kring_mask;
+    _Atomic unsigned *kring_entries;
+    _Atomic unsigned *kflags;
+    _Atomic unsigned *koverflow;
+
+    struct io_uring_cqe *cqes;
+
+    size_t ring_sz;
+    void *ring_ptr;
+};
+
+struct tp_uring {
+    int ring_fd;
+    unsigned flags;
+    unsigned features;
+    struct tp_uring_sq sq;
+    struct tp_uring_cq cq;
+    int kmaxconn;
+    int to_submit;
+};
+
+/*
+ * Closing and free the io_uring, associative memories, meanwhile would be unmap appropriately.
+ */
+inline void tp_uring_close_free(struct tp_uring *uring) {
+    if (uring->sq.ring_ptr != NULL) {
+        munmap(uring->sq.ring_ptr, uring->sq.ring_sz);
+    }
+    if (uring->cq.ring_ptr != NULL && uring->cq.ring_ptr != uring->sq.ring_ptr) {
+        munmap(uring->cq.ring_ptr, uring->cq.ring_sz);
+    }
+    if (uring->ring_fd > 0) {
+        close(uring->ring_fd);
+    }
+    free(uring);
+}
+
+/*
+ * Adjust the maxconnections into io_uring entries.
+ * Negative or zero maxconnection will be adjusted into io_uring max sq entries.
+ */
+inline int _tp_uring_entries(int maxconnection) {
+    static const int maxvalue = 32768;  // max size of sq entryies.
+    int r = maxconnection * 2;
+    if (r > maxvalue || r <= 0) {
+        return maxvalue;
+    }
+    return r;
+}
+
+/*
+ * Creates an io_uring and mmap it appropriately.
+ */
+struct tp_uring *tp_create_uring(int maxconnection) {
+    struct tp_uring *uring = (struct tp_uring *)tp_malloc(sizeof(struct tp_uring));
+    memset(uring, 0, sizeof(struct tp_uring));
+    struct io_uring_params p;
+    memset(&p, 0, sizeof(p));
+    // Start a kernel thread to perform submission queue polling.
+    // With this enabled, we no longer has to call io_uring_enter to submit IO.
+    p.flags = IORING_SETUP_SQPOLL;
+
+    uring->ring_fd = io_uring_setup(_tp_uring_entries(maxconnection), &p);
+    uring->kmaxconn = maxconnection;
+    if (uring->ring_fd < 0) {
+        goto FAIL;
+    }
+    /*
+     * io_uring communication happens via 2 shared kernel-user space ring
+     * buffers, which can be jointly mapped with a single mmap() call in
+     * kernels >= 5.4.
+     */
+    uring->sq.ring_sz = p.sq_off.array + p.sq_entries * sizeof(unsigned);
+    uring->cq.ring_sz = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
+    /* Rather than check for kernel version, the recommended way is to
+     * check the features field of the io_uring_params structure, which is a
+     * bitmask. If IORING_FEAT_SINGLE_MMAP is set, we can do away with the
+     * second mmap() call to map in the completion ring separately.
+     */
+    if (p.features & IORING_FEAT_SINGLE_MMAP) {
+        if (uring->cq.ring_sz > uring->sq.ring_sz) uring->cq.ring_sz = uring->sq.ring_sz;
+        uring->cq.ring_sz = uring->sq.ring_sz;
+    }
+    /* Map in the submission and completion queue ring buffers.
+     *  Kernels < 5.4 only map in the submission queue, though.
+     */
+    uring->sq.ring_ptr = mmap(NULL, uring->sq.ring_sz, PROT_READ | PROT_WRITE,
+                              MAP_SHARED | MAP_POPULATE, uring->ring_fd, IORING_OFF_SQ_RING);
+    if (uring->sq.ring_ptr == MAP_FAILED) {
+        uring->sq.ring_ptr = NULL;
+        goto FAIL;
+    }
+    if (p.features & IORING_FEAT_SINGLE_MMAP) {
+        uring->cq.ring_ptr = uring->sq.ring_ptr;
+    } else {
+        /* Map in the completion queue ring buffer in older kernels separately */
+        uring->cq.ring_ptr = mmap(NULL, uring->cq.ring_sz, PROT_READ | PROT_WRITE,
+                                  MAP_SHARED | MAP_POPULATE, uring->ring_fd, IORING_OFF_CQ_RING);
+        if (uring->cq.ring_ptr == MAP_FAILED) {
+            uring->cq.ring_ptr = NULL;
+            goto FAIL;
+        }
+    }
+
+    /* Save useful fields for later easy reference */
+    uring->sq.khead = uring->sq.ring_ptr + p.sq_off.head;
+    uring->sq.ktail = uring->sq.ring_ptr + p.sq_off.tail;
+    uring->sq.kring_mask = uring->sq.ring_ptr + p.sq_off.ring_mask;
+    uring->sq.kring_entries = uring->sq.ring_ptr + p.sq_off.ring_entries;
+    uring->sq.kflags = uring->sq.ring_ptr + p.sq_off.flags;
+    uring->sq.kdropped = uring->sq.ring_ptr + p.sq_off.dropped;
+    uring->sq.array = uring->sq.ring_ptr + p.sq_off.array;
+
+    size_t size;
+    /* Map in the submission queue entries array */
+    uring->sq.kring_entries =
+        mmap(NULL, p.sq_entries * sizeof(struct io_uring_sqe), PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_POPULATE, uring->ring_fd, IORING_OFF_SQES);
+    if (uring->sq.kring_entries == MAP_FAILED) {
+        uring->sq.kring_entries = NULL;
+        goto FAIL;
+    }
+    /* Save useful fields for later easy reference */
+    uring->cq.khead = uring->cq.ring_ptr + p.cq_off.head;
+    uring->cq.ktail = uring->cq.ring_ptr + p.cq_off.tail;
+    uring->cq.kring_mask = uring->cq.ring_ptr + p.cq_off.ring_mask;
+    uring->cq.kring_entries = uring->cq.ring_ptr + p.cq_off.ring_entries;
+    uring->cq.koverflow = uring->cq.ring_ptr + p.cq_off.overflow;
+    uring->cq.cqes = uring->cq.ring_ptr + p.cq_off.cqes;
+
+    uring->flags = p.flags;
+    uring->features = p.features;
+
+    io_uring_smp_mb();  // make above changes could seen by all processes.
+    return uring;
+FAIL:
+    tp_uring_close_free(uring);
+    return NULL;
+}
+
+/*
+ * Returns true if we're not using SQ thread (thus nobody submits but us)
+ * or if IORING_SQ_NEED_WAKEUP is set, so submit thread must be explicitly
+ * awakened. For the latter case, we set the thread wakeup flag.
+ */
+bool tp_uring_sq_needs_enter(struct tp_uring *ring) {
+    if (!(ring->flags & IORING_SETUP_SQPOLL)) return true;
+    /*
+     * Ensure the kernel can see the store to the SQ tail before we read
+     * the flags.
+     */
+    io_uring_smp_mb();
+    return IO_URING_READ_ONCE(ring->sq.kflags) & IORING_SQ_NEED_WAKEUP;
+}
+
+/*
+ * Returns the number of I/Os success consumed. -1 on error.
+ */
+int tp_uring_wakeup_sq_if_needed(struct tp_uring *ring) {
+    if (tp_uring_sq_needs_enter(ring)) {
+        return io_uring_enter(ring->ring_fd, ring->to_submit, 0, IORING_ENTER_SQ_WAKEUP);
+    }
+    return 0;
+}
+
+int tp_uring_create_buffer(struct tp_uring *ring) {
+    struct iovec *vec;
+    unsigned size;
+    return io_uring_register(ring->ring_fd, IORING_REGISTER_BUFFERS, vec, size);
+}
+
+/***** Epoll implementation *****/
 
 struct tp_ringbuf {
     int16_t roffset;
@@ -454,9 +683,6 @@ int tp_epoll_register_conn(struct tp_epoll *poll, int local, int remote) {
     assert(poll->len <= poll->cap);
     return 0;
 }
-
-#define TP_SETPTR(x, y) \
-    if (x != NULL) *x = y
 
 void _tp_epoll_conn_extract(struct tp_epe *entry, int *fdptr, int *ofdptr,
                             struct tp_ringbuf **rbufptr, struct tp_ringbuf **wbufptr,
